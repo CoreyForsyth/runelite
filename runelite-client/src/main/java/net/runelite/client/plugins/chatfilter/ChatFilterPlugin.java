@@ -28,26 +28,32 @@ package net.runelite.client.plugins.chatfilter;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.CharMatcher;
 import com.google.common.base.Splitter;
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
 import com.google.inject.Provides;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.ExecutionException;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 import javax.inject.Inject;
+import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
 import net.runelite.api.MessageNode;
 import net.runelite.api.Player;
-import net.runelite.client.events.ConfigChanged;
+import net.runelite.api.events.ChatMessage;
 import net.runelite.api.events.OverheadTextChanged;
 import net.runelite.api.events.ScriptCallbackEvent;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
 import net.runelite.client.game.ClanManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.util.ColorUtil;
 import net.runelite.client.util.Text;
 import org.apache.commons.lang3.StringUtils;
 
@@ -56,8 +62,10 @@ import org.apache.commons.lang3.StringUtils;
 	description = "Censor user configurable words or patterns from chat",
 	enabledByDefault = false
 )
+@Slf4j
 public class ChatFilterPlugin extends Plugin
 {
+	private static final String COUNT_FORMAT = " (%d)";
 	private static final Splitter NEWLINE_SPLITTER = Splitter
 		.on("\n")
 		.omitEmptyStrings()
@@ -69,6 +77,15 @@ public class ChatFilterPlugin extends Plugin
 	private final CharMatcher jagexPrintableCharMatcher = Text.JAGEX_PRINTABLE_CHAR_MATCHER;
 	private final List<Pattern> filteredPatterns = new ArrayList<>();
 	private final List<Pattern> filteredNamePatterns = new ArrayList<>();
+	static class Duplicate
+	{
+		int messageId;
+		int count;
+	}
+	private Cache<String, Duplicate> duplicateChatCache = CacheBuilder.newBuilder()
+			.maximumSize(1000)
+			.concurrencyLevel(1)
+			.build();
 
 	@Inject
 	private Client client;
@@ -96,6 +113,7 @@ public class ChatFilterPlugin extends Plugin
 	protected void shutDown() throws Exception
 	{
 		filteredPatterns.clear();
+		duplicateChatCache.invalidateAll();
 		client.refreshChat();
 	}
 
@@ -111,44 +129,35 @@ public class ChatFilterPlugin extends Plugin
 		int intStackSize = client.getIntStackSize();
 		int messageType = intStack[intStackSize - 2];
 		int messageId = intStack[intStackSize - 1];
-
 		ChatMessageType chatMessageType = ChatMessageType.of(messageType);
-
-		// Only filter public chat and private messages
-		switch (chatMessageType)
-		{
-			case PUBLICCHAT:
-			case MODCHAT:
-			case AUTOTYPER:
-			case PRIVATECHAT:
-			case MODPRIVATECHAT:
-			case FRIENDSCHAT:
-				break;
-			case LOGINLOGOUTNOTIFICATION:
-				if (config.filterLogin())
-				{
-					// Block the message
-					intStack[intStackSize - 3] = 0;
-				}
-				return;
-			default:
-				return;
-		}
-
 		MessageNode messageNode = client.getMessages().get(messageId);
 		String name = messageNode.getName();
-		if (!shouldFilterPlayerMessage(name))
-		{
-			return;
-		}
-
 		String[] stringStack = client.getStringStack();
 		int stringStackSize = client.getStringStackSize();
-
 		String message = stringStack[stringStackSize - 1];
-		String censoredMessage = censorMessage(name, message);
+		Duplicate duplicateCacheEntry = duplicateChatCache.getIfPresent(name + ":" + message);
+		boolean shouldBlockMessage = false;
 
-		if (censoredMessage == null)
+		if (shouldCollapseMessageType(chatMessageType))
+		{
+			if (duplicateCacheEntry != null)
+			{
+				shouldBlockMessage = duplicateCacheEntry.messageId != messageId;
+			}
+		}
+
+		// Only filter public chat and private messages
+		if (shouldFilterMessageType(chatMessageType) && shouldFilterPlayerMessage(name))
+		{
+			message = censorMessage(name, message);
+			shouldBlockMessage |= message == null;
+		}
+		else if (chatMessageType == ChatMessageType.LOGINLOGOUTNOTIFICATION && config.filterLogin())
+		{
+			shouldBlockMessage = true;
+		}
+
+		if (shouldBlockMessage)
 		{
 			// Block the message
 			intStack[intStackSize - 3] = 0;
@@ -156,7 +165,11 @@ public class ChatFilterPlugin extends Plugin
 		else
 		{
 			// Replace the message
-			stringStack[stringStackSize - 1] = censoredMessage;
+			if (duplicateCacheEntry != null && duplicateCacheEntry.count > 1)
+			{
+				message += ColorUtil.wrapWithColorTag(String.format(COUNT_FORMAT, duplicateCacheEntry.count), config.chatCountColor());
+			}
+			stringStack[stringStackSize - 1] = message;
 		}
 	}
 
@@ -176,6 +189,17 @@ public class ChatFilterPlugin extends Plugin
 		}
 
 		event.getActor().setOverheadText(message);
+	}
+
+	@Subscribe
+	public void onChatMessage(ChatMessage chatMessage) throws ExecutionException
+	{
+		if (shouldCollapseMessageType(chatMessage.getType()))
+		{
+			Duplicate currentEntry = duplicateChatCache.get(chatMessage.getName() + ":" + chatMessage.getMessage(), Duplicate::new);
+			currentEntry.count++;
+			currentEntry.messageId = chatMessage.getMessageNode().getId();
+		}
 	}
 
 	boolean shouldFilterPlayerMessage(String playerName)
@@ -292,4 +316,40 @@ public class ChatFilterPlugin extends Plugin
 		}
 		return false;
 	}
+
+	private boolean shouldFilterMessageType(ChatMessageType chatMessageType)
+	{
+		switch (chatMessageType)
+		{
+			case PUBLICCHAT:
+			case MODCHAT:
+			case AUTOTYPER:
+			case PRIVATECHAT:
+			case MODPRIVATECHAT:
+			case FRIENDSCHAT:
+				return true;
+			default:
+				return false;
+		}
+	}
+
+	private boolean shouldCollapseMessageType(ChatMessageType chatMessageType)
+	{
+		switch (chatMessageType)
+		{
+			case ENGINE:
+			case GAMEMESSAGE:
+			case ITEM_EXAMINE:
+			case NPC_EXAMINE:
+			case OBJECT_EXAMINE:
+			case SPAM:
+				return config.collapseGameChat();
+			case PUBLICCHAT:
+			case MODCHAT:
+				return config.collapsePlayerChat();
+			default:
+				return false;
+		}
+	}
+
 }
