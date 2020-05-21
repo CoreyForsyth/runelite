@@ -142,7 +142,9 @@ public class ChatFilterPlugin extends Plugin
 		{
 			if (duplicateCacheEntry != null)
 			{
-				shouldBlockMessage = duplicateCacheEntry.messageId != messageId;
+				shouldBlockMessage = duplicateCacheEntry.messageId != messageId ||
+						((chatMessageType == ChatMessageType.PUBLICCHAT || chatMessageType == ChatMessageType.MODCHAT) &&
+								config.maxRepeatedPublicChats() > 1 && duplicateCacheEntry.count > config.maxRepeatedPublicChats());
 			}
 		}
 
