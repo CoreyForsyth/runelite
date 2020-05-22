@@ -28,11 +28,11 @@ package net.runelite.client.plugins.chatfilter;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.CharMatcher;
 import com.google.common.base.Splitter;
-import com.google.common.cache.Cache;
-import com.google.common.cache.CacheBuilder;
 import com.google.inject.Provides;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ExecutionException;
 import java.util.regex.Matcher;
@@ -82,10 +82,14 @@ public class ChatFilterPlugin extends Plugin
 		int messageId;
 		int count;
 	}
-	private Cache<String, Duplicate> duplicateChatCache = CacheBuilder.newBuilder()
-			.maximumSize(1000)
-			.concurrencyLevel(1)
-			.build();
+	private LinkedHashMap<String, Duplicate> duplicateChatCache = new LinkedHashMap<String, Duplicate>()
+	{
+		@Override
+		protected boolean removeEldestEntry(Map.Entry eldest)
+		{
+			return size() > 100;
+		}
+	};
 
 	@Inject
 	private Client client;
@@ -113,7 +117,7 @@ public class ChatFilterPlugin extends Plugin
 	protected void shutDown() throws Exception
 	{
 		filteredPatterns.clear();
-		duplicateChatCache.invalidateAll();
+		duplicateChatCache.clear();
 		client.refreshChat();
 	}
 
@@ -135,7 +139,7 @@ public class ChatFilterPlugin extends Plugin
 		String[] stringStack = client.getStringStack();
 		int stringStackSize = client.getStringStackSize();
 		String message = stringStack[stringStackSize - 1];
-		Duplicate duplicateCacheEntry = duplicateChatCache.getIfPresent(name + ":" + message);
+		Duplicate duplicateCacheEntry = duplicateChatCache.getOrDefault(name + ":" + messageNode.getValue(), null);
 		boolean shouldBlockMessage = false;
 
 		if (shouldCollapseMessageType(chatMessageType))
@@ -198,9 +202,16 @@ public class ChatFilterPlugin extends Plugin
 	{
 		if (shouldCollapseMessageType(chatMessage.getType()))
 		{
-			Duplicate currentEntry = duplicateChatCache.get(chatMessage.getName() + ":" + chatMessage.getMessage(), Duplicate::new);
+			// Remove this message from cache and re-put it so it is the most recent
+			String key = chatMessage.getMessageNode().getName() + ":" + chatMessage.getMessageNode().getValue();
+			Duplicate currentEntry = duplicateChatCache.remove(key);
+			if (currentEntry == null)
+			{
+				currentEntry = new Duplicate();
+			}
 			currentEntry.count++;
 			currentEntry.messageId = chatMessage.getMessageNode().getId();
+			duplicateChatCache.put(key, currentEntry);
 		}
 	}
 
